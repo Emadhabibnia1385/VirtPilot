@@ -1,0 +1,1057 @@
+import os
+import asyncio
+import math
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+import aiohttp
+import aiosqlite
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+# -----------------------------
+# ENV / CONFIG
+# -----------------------------
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing. Put it in .env")
+
+DB_PATH = "bot.db"
+
+
+# -----------------------------
+# FSM States
+# -----------------------------
+class AddProfile(StatesGroup):
+    title = State()
+    panel_url = State()
+    api_key = State()
+    api_pass = State()
+    verify_ssl = State()
+
+
+class SetThresholds(StatesGroup):
+    disk_warn = State()
+    disk_critical = State()
+    bw_warn = State()
+    bw_critical = State()
+
+
+# -----------------------------
+# DB LAYER
+# -----------------------------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS api_profiles(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            panel_url TEXT NOT NULL,
+            api_key TEXT NOT NULL,
+            api_pass TEXT NOT NULL,
+            verify_ssl INTEGER NOT NULL DEFAULT 1
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS alert_settings(
+            user_id INTEGER PRIMARY KEY,
+            alerts_enabled INTEGER NOT NULL DEFAULT 1,
+            disk_warn INTEGER NOT NULL DEFAULT 80,
+            disk_critical INTEGER NOT NULL DEFAULT 100,
+            bw_warn INTEGER NOT NULL DEFAULT 80,
+            bw_critical INTEGER NOT NULL DEFAULT 100,
+            suspend_alerts INTEGER NOT NULL DEFAULT 1
+        )
+        """)
+        # برای جلوگیری از اسپم: آخرین وضعیت ارسال‌شده برای هر VPS
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS alert_state(
+            user_id INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            vps_id TEXT NOT NULL,
+            last_disk_level TEXT,
+            last_bw_level TEXT,
+            last_suspend INTEGER,
+            PRIMARY KEY(user_id, profile_id, vps_id)
+        )
+        """)
+        await db.commit()
+
+
+async def ensure_alert_settings(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM alert_settings WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute("INSERT INTO alert_settings(user_id) VALUES(?)", (user_id,))
+            await db.commit()
+
+
+async def get_alert_settings(user_id: int) -> Dict[str, Any]:
+    await ensure_alert_settings(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT alerts_enabled,disk_warn,disk_critical,bw_warn,bw_critical,suspend_alerts
+            FROM alert_settings WHERE user_id=?
+        """, (user_id,))
+        r = await cur.fetchone()
+        return {
+            "alerts_enabled": bool(r[0]),
+            "disk_warn": int(r[1]),
+            "disk_critical": int(r[2]),
+            "bw_warn": int(r[3]),
+            "bw_critical": int(r[4]),
+            "suspend_alerts": bool(r[5]),
+        }
+
+
+async def update_alert_settings(user_id: int, **kwargs):
+    await ensure_alert_settings(user_id)
+    if not kwargs:
+        return
+    fields, vals = [], []
+    for k, v in kwargs.items():
+        fields.append(f"{k}=?")
+        if isinstance(v, bool):
+            vals.append(1 if v else 0)
+        else:
+            vals.append(v)
+    vals.append(user_id)
+    q = "UPDATE alert_settings SET " + ",".join(fields) + " WHERE user_id=?"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(q, tuple(vals))
+        await db.commit()
+
+
+async def add_profile(user_id: int, title: str, panel_url: str, api_key: str, api_pass: str, verify_ssl: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO api_profiles(user_id,title,panel_url,api_key,api_pass,verify_ssl)
+            VALUES(?,?,?,?,?,?)
+        """, (user_id, title, panel_url, api_key, api_pass, 1 if verify_ssl else 0))
+        await db.commit()
+
+
+async def list_profiles(user_id: int) -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT id,title,panel_url,verify_ssl
+            FROM api_profiles WHERE user_id=?
+            ORDER BY id DESC
+        """, (user_id,))
+        rows = await cur.fetchall()
+        return [{"id": r[0], "title": r[1], "panel_url": r[2], "verify_ssl": bool(r[3])} for r in rows]
+
+
+async def get_profile(user_id: int, profile_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT id,title,panel_url,api_key,api_pass,verify_ssl
+            FROM api_profiles
+            WHERE user_id=? AND id=?
+        """, (user_id, profile_id))
+        r = await cur.fetchone()
+        if not r:
+            return None
+        return {
+            "id": r[0],
+            "title": r[1],
+            "panel_url": r[2],
+            "api_key": r[3],
+            "api_pass": r[4],
+            "verify_ssl": bool(r[5]),
+        }
+
+
+async def delete_profile(user_id: int, profile_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM api_profiles WHERE user_id=? AND id=?", (user_id, profile_id))
+        await db.execute("DELETE FROM alert_state WHERE user_id=? AND profile_id=?", (user_id, profile_id))
+        await db.commit()
+
+
+async def get_alert_state(user_id: int, profile_id: int, vps_id: str) -> Dict[str, Any]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT last_disk_level,last_bw_level,last_suspend
+            FROM alert_state
+            WHERE user_id=? AND profile_id=? AND vps_id=?
+        """, (user_id, profile_id, vps_id))
+        r = await cur.fetchone()
+        return {
+            "last_disk_level": r[0] if r else None,
+            "last_bw_level": r[1] if r else None,
+            "last_suspend": int(r[2]) if (r and r[2] is not None) else None,
+        }
+
+
+async def set_alert_state(user_id: int, profile_id: int, vps_id: str,
+                          last_disk_level: Optional[str], last_bw_level: Optional[str],
+                          last_suspend: Optional[int]):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO alert_state(user_id,profile_id,vps_id,last_disk_level,last_bw_level,last_suspend)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(user_id,profile_id,vps_id)
+            DO UPDATE SET last_disk_level=excluded.last_disk_level,
+                         last_bw_level=excluded.last_bw_level,
+                         last_suspend=excluded.last_suspend
+        """, (user_id, profile_id, vps_id, last_disk_level, last_bw_level, last_suspend))
+        await db.commit()
+
+
+# -----------------------------
+# UI / KEYBOARDS
+# -----------------------------
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔑 پروفایل‌های API"), KeyboardButton(text="🖥 VPS ها")],
+            [KeyboardButton(text="🔔 اعلان‌ها"), KeyboardButton(text="ℹ️ راهنما")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def profiles_kb(profiles: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = []
+    for p in profiles:
+        rows.append([InlineKeyboardButton(text=p["title"], callback_data=f"prof:{p['id']}")])
+    rows.append([InlineKeyboardButton(text="➕ افزودن پروفایل", callback_data="prof_add")])
+    rows.append([InlineKeyboardButton(text="🏠 خانه", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def profile_manage_kb(profile_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🖥 VPS ها", callback_data=f"vps_list:{profile_id}")],
+        [InlineKeyboardButton(text="🗑 حذف پروفایل", callback_data=f"prof_del:{profile_id}")],
+        [InlineKeyboardButton(text="🏠 خانه", callback_data="home")],
+    ])
+
+
+def alerts_kb(enabled: bool, suspend: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("✅ اعلان‌ها: روشن" if enabled else "❌ اعلان‌ها: خاموش"),
+            callback_data="alerts_toggle"
+        )],
+        [InlineKeyboardButton(
+            text=("✅ Suspend alerts: روشن" if suspend else "⛔ Suspend alerts: خاموش"),
+            callback_data="alerts_suspend_toggle"
+        )],
+        [InlineKeyboardButton(text="✏️ تنظیم آستانه‌ها", callback_data="alerts_set_thresholds")],
+        [InlineKeyboardButton(text="🏠 خانه", callback_data="home")],
+    ])
+
+
+def vps_profiles_pick_kb(profiles: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = []
+    for p in profiles:
+        rows.append([InlineKeyboardButton(text=p["title"], callback_data=f"vps_list:{p['id']}")])
+    rows.append([InlineKeyboardButton(text="🏠 خانه", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def vps_list_kb(profile_id: int, vps_list: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = []
+    for v in vps_list[:50]:  # جلوگیری از خیلی طولانی شدن
+        title = v.get("name") or v.get("hostname") or f"VPS {v.get('vpsid')}"
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"vps:{profile_id}:{v.get('vpsid')}")])
+    rows.append([InlineKeyboardButton(text="🔄 بروزرسانی", callback_data=f"vps_list:{profile_id}")])
+    rows.append([InlineKeyboardButton(text="🏠 خانه", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def vps_manage_kb(profile_id: int, vps_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⏹ توقف", callback_data=f"vps_act:{profile_id}:{vps_id}:stop"),
+            InlineKeyboardButton(text="🔁 ریستارت", callback_data=f"vps_act:{profile_id}:{vps_id}:restart"),
+        ],
+        [
+            InlineKeyboardButton(text="▶️ روشن کردن", callback_data=f"vps_act:{profile_id}:{vps_id}:start"),
+            InlineKeyboardButton(text="⏻ خاموشی کامل", callback_data=f"vps_act:{profile_id}:{vps_id}:poweroff"),
+        ],
+        [
+            InlineKeyboardButton(text="💽 دیسک", callback_data=f"vps_info:{profile_id}:{vps_id}:disk"),
+            InlineKeyboardButton(text="📶 ترافیک", callback_data=f"vps_info:{profile_id}:{vps_id}:bw"),
+        ],
+        [
+            InlineKeyboardButton(text="🔄 تازه‌سازی", callback_data=f"vps:{profile_id}:{vps_id}"),
+            InlineKeyboardButton(text="⬅️ برگشت", callback_data=f"vps_list:{profile_id}"),
+        ],
+        [InlineKeyboardButton(text="🏠 خانه", callback_data="home")],
+    ])
+
+
+# -----------------------------
+# Virtualizor API (Generic)
+# -----------------------------
+def normalize_panel_url(url: str) -> str:
+    url = url.strip()
+    url = url.rstrip("/")
+    return url
+
+
+def is_valid_url(url: str) -> bool:
+    return bool(re.match(r"^https?://", url.strip(), re.I))
+
+
+async def v_api_request(
+    panel_url: str,
+    api_key: str,
+    api_pass: str,
+    verify_ssl: bool,
+    act: str,
+    params: Optional[Dict[str, Any]] = None,
+    method: str = "GET",
+) -> Dict[str, Any]:
+    """
+    Virtualizor API URL patterns can vary by install.
+    Common format:
+        {panel_url}/index.php?act=...&api=json&apikey=...&apipass=...
+    This function is flexible; if your panel differs, edit BASE_ENDPOINT below.
+    """
+    BASE_ENDPOINT = f"{panel_url}/index.php"
+    q = {
+        "act": act,
+        "api": "json",
+        "apikey": api_key,
+        "apipass": api_pass,
+    }
+    if params:
+        q.update(params)
+
+    timeout = aiohttp.ClientTimeout(total=25)
+    connector = aiohttp.TCPConnector(ssl=verify_ssl)
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        if method.upper() == "POST":
+            async with session.post(BASE_ENDPOINT, params=q) as resp:
+                data = await resp.json(content_type=None)
+        else:
+            async with session.get(BASE_ENDPOINT, params=q) as resp:
+                data = await resp.json(content_type=None)
+
+    if isinstance(data, dict):
+        return data
+    return {"raw": data}
+
+
+def pick_vps_list(api_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Virtualizor often returns vps list under keys like: 'vs' or 'vps' or nested.
+    We try common patterns.
+    """
+    if not isinstance(api_data, dict):
+        return []
+    for key in ("vs", "vps", "data"):
+        v = api_data.get(key)
+        if isinstance(v, dict):
+            # dict of dicts
+            arr = []
+            for _, item in v.items():
+                if isinstance(item, dict) and ("vpsid" in item or "vps_id" in item):
+                    if "vpsid" not in item and "vps_id" in item:
+                        item["vpsid"] = item["vps_id"]
+                    arr.append(item)
+            if arr:
+                return arr
+        if isinstance(v, list):
+            return v
+    # sometimes api_data itself is {vpsid: {...}}
+    if all(isinstance(x, str) for x in api_data.keys()) and any(isinstance(v, dict) for v in api_data.values()):
+        arr = []
+        for _, item in api_data.items():
+            if isinstance(item, dict) and ("vpsid" in item or "vps_id" in item):
+                if "vpsid" not in item and "vps_id" in item:
+                    item["vpsid"] = item["vps_id"]
+                arr.append(item)
+        if arr:
+            return arr
+    return []
+
+
+def pick_vps_details(api_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    VPS detail often in key 'info' or directly.
+    """
+    if not isinstance(api_data, dict):
+        return {}
+    for key in ("info", "vps", "vs", "data"):
+        v = api_data.get(key)
+        if isinstance(v, dict) and (("vpsid" in v) or ("hostname" in v) or ("name" in v)):
+            return v
+    return api_data
+
+
+def to_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+
+def fmt_gb(x: Any) -> str:
+    # x could be bytes or MB depending on panel; we show raw if uncertain
+    try:
+        val = float(x)
+        # اگر خیلی بزرگ بود احتمالاً بایت است
+        if val > 10_000_000_000:
+            gb = val / (1024**3)
+            return f"{gb:.2f} GB"
+        # اگر مثل MB باشد:
+        if val > 10_000:
+            gb = val / 1024
+            return f"{gb:.2f} GB"
+        return f"{val:.2f}"
+    except Exception:
+        return str(x)
+
+
+def compute_percent(used: float, total: float) -> Optional[int]:
+    if total <= 0:
+        return None
+    return int(math.floor((used / total) * 100))
+
+
+def classify_level(pct: Optional[int], warn: int, critical: int) -> Optional[str]:
+    if pct is None:
+        return None
+    if pct >= critical:
+        return "critical"
+    if pct >= warn:
+        return "warn"
+    return "ok"
+
+
+# -----------------------------
+# Texts
+# -----------------------------
+def dashboard_text(user_id: int) -> str:
+    return (
+        "🏠 داشبورد\n"
+        f"👤 کاربر: {user_id}\n\n"
+        "از منو یکی از گزینه‌ها را انتخاب کنید."
+    )
+
+
+GUIDE_TEXT = (
+    "ℹ️ راهنما\n\n"
+    "1) ابتدا از منوی «🔑 پروفایل API» یک پروفایل بسازید.\n"
+    "2) در پنل Virtualizor از مسیر «API Credentials» می‌توانید Key/Pass بسازید.\n"
+    "3) بعد از ساخت پروفایل، از «🖥 VPS ها» سرورها را مدیریت کنید.\n\n"
+    "نکته: اگر پنل شما SSL سلف‌ساین دارد، هنگام افزودن پروفایل گزینه «بدون Verify SSL» را انتخاب کنید."
+)
+
+
+# -----------------------------
+# BOT / DISPATCHER
+# -----------------------------
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+async def show_home(msg_or_cb: Any):
+    user_id = msg_or_cb.from_user.id
+    if isinstance(msg_or_cb, CallbackQuery):
+        await msg_or_cb.message.edit_text(dashboard_text(user_id))
+        await msg_or_cb.answer()
+        await msg_or_cb.message.answer("🏠", reply_markup=main_menu_kb())
+    else:
+        await msg_or_cb.answer(dashboard_text(user_id), reply_markup=main_menu_kb())
+
+
+async def require_profiles(user_id: int) -> List[Dict[str, Any]]:
+    return await list_profiles(user_id)
+
+
+# -----------------------------
+# Start / Home
+# -----------------------------
+@dp.message(CommandStart())
+async def start(m: Message):
+    await m.answer(dashboard_text(m.from_user.id), reply_markup=main_menu_kb())
+
+
+@dp.callback_query(F.data == "home")
+async def cb_home(cb: CallbackQuery):
+    await show_home(cb)
+
+
+# -----------------------------
+# Help
+# -----------------------------
+@dp.message(F.text == "ℹ️ راهنما")
+async def help_menu(m: Message):
+    await m.answer(GUIDE_TEXT, reply_markup=main_menu_kb())
+
+
+# -----------------------------
+# API Profiles
+# -----------------------------
+@dp.message(F.text == "🔑 پروفایل‌های API")
+async def profiles_menu(m: Message):
+    profiles = await list_profiles(m.from_user.id)
+    text = "🔑 پروفایل‌های API\n\n" + (f"تعداد: {len(profiles)}\n" if profiles else "هنوز پروفایلی ندارید.\n")
+    text += "برای مدیریت روی هر پروفایل بزنید:"
+    await m.answer(text, reply_markup=profiles_kb(profiles))
+
+
+@dp.callback_query(F.data.startswith("prof:"))
+async def cb_profile(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    profile_id = int(cb.data.split(":")[1])
+    p = await get_profile(user_id, profile_id)
+    if not p:
+        await cb.answer("پروفایل پیدا نشد", show_alert=True)
+        return
+    verify = "✅ Verify SSL" if p["verify_ssl"] else "⛔ بدون Verify SSL"
+    text = (
+        "🔑 پروفایل\n\n"
+        f"عنوان: {p['title']}\n"
+        f"URL: {p['panel_url']}\n"
+        f"SSL: {verify}\n"
+    )
+    await cb.message.edit_text(text, reply_markup=profile_manage_kb(profile_id))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "prof_add")
+async def cb_profile_add(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(AddProfile.title)
+    await cb.message.answer(
+        "➕ افزودن پروفایل جدید\n\n"
+        "لطفاً یک عنوان برای این پروفایل بفرستید (مثلاً: Panel 1)."
+    )
+    await cb.answer()
+
+
+@dp.message(AddProfile.title)
+async def addprof_title(m: Message, state: FSMContext):
+    title = (m.text or "").strip()
+    if len(title) < 2:
+        await m.answer("عنوان خیلی کوتاه است. دوباره بفرست.")
+        return
+    await state.update_data(title=title)
+    await state.set_state(AddProfile.panel_url)
+    await m.answer("حالا Panel URL را بفرستید.\nمثال: https://hostname:4083")
+
+
+@dp.message(AddProfile.panel_url)
+async def addprof_url(m: Message, state: FSMContext):
+    url = normalize_panel_url(m.text or "")
+    if not is_valid_url(url):
+        await m.answer("URL معتبر نیست. حتماً با http یا https شروع شود.\nمثال: https://hostname:4083")
+        return
+    await state.update_data(panel_url=url)
+    await state.set_state(AddProfile.api_key)
+    await m.answer("حالا API Key را بفرستید.")
+
+
+@dp.message(AddProfile.api_key)
+async def addprof_key(m: Message, state: FSMContext):
+    key = (m.text or "").strip()
+    if len(key) < 5:
+        await m.answer("API Key نامعتبر است. دوباره بفرست.")
+        return
+    await state.update_data(api_key=key)
+    await state.set_state(AddProfile.api_pass)
+    await m.answer("حالا API Pass را بفرستید.")
+
+
+@dp.message(AddProfile.api_pass)
+async def addprof_pass(m: Message, state: FSMContext):
+    apipass = (m.text or "").strip()
+    if len(apipass) < 5:
+        await m.answer("API Pass نامعتبر است. دوباره بفرست.")
+        return
+    await state.update_data(api_pass=apipass)
+    await state.set_state(AddProfile.verify_ssl)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Verify SSL", callback_data="ssl:1")],
+        [InlineKeyboardButton(text="⛔ بدون Verify SSL (Self-signed)", callback_data="ssl:0")],
+    ])
+    await m.answer("SSL را انتخاب کنید:", reply_markup=kb)
+
+
+@dp.callback_query(AddProfile.verify_ssl, F.data.startswith("ssl:"))
+async def addprof_ssl(cb: CallbackQuery, state: FSMContext):
+    verify_ssl = cb.data.split(":")[1] == "1"
+    data = await state.get_data()
+    await add_profile(
+        user_id=cb.from_user.id,
+        title=data["title"],
+        panel_url=data["panel_url"],
+        api_key=data["api_key"],
+        api_pass=data["api_pass"],
+        verify_ssl=verify_ssl,
+    )
+    await state.clear()
+    await cb.message.answer("✅ پروفایل اضافه شد.", reply_markup=main_menu_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("prof_del:"))
+async def cb_profile_del(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    profile_id = int(cb.data.split(":")[1])
+    await delete_profile(user_id, profile_id)
+    await cb.message.answer("🗑 پروفایل حذف شد.", reply_markup=main_menu_kb())
+    await cb.answer()
+
+
+# -----------------------------
+# VPS LIST / MANAGE
+# -----------------------------
+@dp.message(F.text == "🖥 VPS ها")
+async def vps_menu(m: Message):
+    profiles = await list_profiles(m.from_user.id)
+    if not profiles:
+        await m.answer("اول یک پروفایل بسازید: 🔑 پروفایل‌های API", reply_markup=main_menu_kb())
+        return
+    await m.answer("🖥 VPS ها\n\nیک پروفایل را انتخاب کنید:", reply_markup=vps_profiles_pick_kb(profiles))
+
+
+@dp.callback_query(F.data.startswith("vps_list:"))
+async def cb_vps_list(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    profile_id = int(cb.data.split(":")[1])
+    p = await get_profile(user_id, profile_id)
+    if not p:
+        await cb.answer("پروفایل پیدا نشد", show_alert=True)
+        return
+
+    # ✅ اکشن لیست VPS ها
+    # اگر در پنل شما فرق داشت، این را تغییر بده:
+    # act="vs" یا "listvs" یا ...
+    act = "vs"
+
+    try:
+        data = await v_api_request(p["panel_url"], p["api_key"], p["api_pass"], p["verify_ssl"], act=act)
+        vps_list = pick_vps_list(data)
+    except Exception as e:
+        await cb.message.answer(f"خطا در اتصال به پنل:\n{e}")
+        await cb.answer()
+        return
+
+    text = f"🖥 VPS ها\n\nپروفایل: {p['title']}\nتعداد: {len(vps_list)}\n\nبرای مدیریت روی VPS بزنید:"
+    await cb.message.edit_text(text, reply_markup=vps_list_kb(profile_id, vps_list))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("vps:"))
+async def cb_vps_detail(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    _, profile_id_s, vps_id = cb.data.split(":")
+    profile_id = int(profile_id_s)
+
+    p = await get_profile(user_id, profile_id)
+    if not p:
+        await cb.answer("پروفایل پیدا نشد", show_alert=True)
+        return
+
+    # ✅ اکشن جزئیات VPS
+    # اگر در پنل شما فرق داشت، این را تغییر بده:
+    act = "managevs"
+
+    try:
+        data = await v_api_request(
+            p["panel_url"], p["api_key"], p["api_pass"], p["verify_ssl"],
+            act=act,
+            params={"vpsid": vps_id}
+        )
+        info = pick_vps_details(data)
+    except Exception as e:
+        await cb.message.answer(f"خطا:\n{e}")
+        await cb.answer()
+        return
+
+    # تلاش برای پر کردن مثل عکس
+    name = info.get("hostname") or info.get("name") or f"VPS {vps_id}"
+    os_name = info.get("os_name") or info.get("os") or "-"
+    virt = info.get("virt") or info.get("type") or "-"
+    ip = info.get("ip") or info.get("ipaddress") or info.get("primary_ip") or "-"
+    cpu = info.get("cores") or info.get("cpu") or info.get("vps_cpu") or "-"
+    ram = info.get("ram") or info.get("vps_ram") or info.get("memory") or "-"
+    disk = info.get("disk") or info.get("vps_disk") or info.get("hdd") or "-"
+
+    # BW اگر داشت:
+    bw_used = info.get("bandwidth_used") or info.get("bw_used") or info.get("used_bandwidth")
+    bw_total = info.get("bandwidth") or info.get("bw") or info.get("total_bandwidth")
+
+    bw_line = ""
+    if bw_used is not None and bw_total is not None:
+        bw_line = f"📶 BW: {fmt_gb(bw_used)} / {fmt_gb(bw_total)}"
+
+    text = (
+        f"🖥 {name}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🆔 ID: {vps_id}\n"
+        f"🧩 OS: {os_name} • {virt}\n"
+        f"🌐 IP: {ip}\n"
+        f"🧠 CPU: {cpu}\n"
+        f"🧷 RAM: {ram}\n"
+        f"💽 Disk: {disk}\n"
+        f"{bw_line}\n"
+    ).strip()
+
+    await cb.message.edit_text(text, reply_markup=vps_manage_kb(profile_id, vps_id))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("vps_act:"))
+async def cb_vps_action(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    _, profile_id_s, vps_id, action = cb.data.split(":")
+    profile_id = int(profile_id_s)
+
+    p = await get_profile(user_id, profile_id)
+    if not p:
+        await cb.answer("پروفایل پیدا نشد", show_alert=True)
+        return
+
+    # ✅ اکشن‌های پاور
+    # در بعضی پنل‌ها act متفاوت است. اینجا یک مدل رایج:
+    # act="managevs" و params={"vpsid":..., "action":"start/stop/restart/poweroff"}
+    act = "managevs"
+    params = {"vpsid": vps_id, "action": action}
+
+    try:
+        await v_api_request(p["panel_url"], p["api_key"], p["api_pass"], p["verify_ssl"], act=act, params=params, method="POST")
+        await cb.answer("✅ انجام شد")
+    except Exception as e:
+        await cb.answer("خطا", show_alert=True)
+        await cb.message.answer(f"خطا:\n{e}")
+        return
+
+    # refresh details
+    await cb_vps_detail(cb)
+
+
+@dp.callback_query(F.data.startswith("vps_info:"))
+async def cb_vps_info(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    _, profile_id_s, vps_id, which = cb.data.split(":")
+    profile_id = int(profile_id_s)
+
+    p = await get_profile(user_id, profile_id)
+    if not p:
+        await cb.answer("پروفایل پیدا نشد", show_alert=True)
+        return
+
+    act = "managevs"
+    try:
+        data = await v_api_request(p["panel_url"], p["api_key"], p["api_pass"], p["verify_ssl"], act=act, params={"vpsid": vps_id})
+        info = pick_vps_details(data)
+    except Exception as e:
+        await cb.message.answer(f"خطا:\n{e}")
+        await cb.answer()
+        return
+
+    name = info.get("hostname") or info.get("name") or f"VPS {vps_id}"
+
+    if which == "disk":
+        # اگر فیلدها در پنل شما فرق دارد این 2 تا را مچ کن
+        used = info.get("disk_used") or info.get("used_disk") or info.get("hdd_used")
+        total = info.get("disk") or info.get("vps_disk") or info.get("hdd")
+        text = f"💽 دیسک\n\n{name}\nUsed: {used}\nTotal: {total}"
+    else:
+        used = info.get("bandwidth_used") or info.get("bw_used") or info.get("used_bandwidth")
+        total = info.get("bandwidth") or info.get("bw") or info.get("total_bandwidth")
+        text = f"📶 ترافیک\n\n{name}\nUsed: {used}\nTotal: {total}"
+
+    await cb.message.answer(text)
+    await cb.answer()
+
+
+# -----------------------------
+# Alerts
+# -----------------------------
+@dp.message(F.text == "🔔 اعلان‌ها")
+async def alerts_menu(m: Message):
+    s = await get_alert_settings(m.from_user.id)
+    text = (
+        "🔔 تنظیمات اعلان‌ها\n\n"
+        f"اعلان‌ها: {'روشن ✅' if s['alerts_enabled'] else 'خاموش ❌'}\n"
+        f"Disk Warn: {s['disk_warn']}٪ | Critical: {s['disk_critical']}٪\n"
+        f"BW Warn: {s['bw_warn']}٪ | Critical: {s['bw_critical']}٪\n"
+        f"Suspend alerts: {'روشن ✅' if s['suspend_alerts'] else 'خاموش ⛔'}\n\n"
+        "اگر فعال باشد، ربات به صورت دوره‌ای وضعیت VPS ها را چک می‌کند."
+    )
+    await m.answer(text, reply_markup=alerts_kb(s["alerts_enabled"], s["suspend_alerts"]))
+
+
+@dp.callback_query(F.data == "alerts_toggle")
+async def cb_alerts_toggle(cb: CallbackQuery):
+    s = await get_alert_settings(cb.from_user.id)
+    await update_alert_settings(cb.from_user.id, alerts_enabled=not s["alerts_enabled"])
+    s2 = await get_alert_settings(cb.from_user.id)
+    text = (
+        "🔔 تنظیمات اعلان‌ها\n\n"
+        f"اعلان‌ها: {'روشن ✅' if s2['alerts_enabled'] else 'خاموش ❌'}\n"
+        f"Disk Warn: {s2['disk_warn']}٪ | Critical: {s2['disk_critical']}٪\n"
+        f"BW Warn: {s2['bw_warn']}٪ | Critical: {s2['bw_critical']}٪\n"
+        f"Suspend alerts: {'روشن ✅' if s2['suspend_alerts'] else 'خاموش ⛔'}\n\n"
+        "اگر فعال باشد، ربات به صورت دوره‌ای وضعیت VPS ها را چک می‌کند."
+    )
+    await cb.message.edit_text(text, reply_markup=alerts_kb(s2["alerts_enabled"], s2["suspend_alerts"]))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "alerts_suspend_toggle")
+async def cb_alerts_suspend_toggle(cb: CallbackQuery):
+    s = await get_alert_settings(cb.from_user.id)
+    await update_alert_settings(cb.from_user.id, suspend_alerts=not s["suspend_alerts"])
+    s2 = await get_alert_settings(cb.from_user.id)
+    text = (
+        "🔔 تنظیمات اعلان‌ها\n\n"
+        f"اعلان‌ها: {'روشن ✅' if s2['alerts_enabled'] else 'خاموش ❌'}\n"
+        f"Disk Warn: {s2['disk_warn']}٪ | Critical: {s2['disk_critical']}٪\n"
+        f"BW Warn: {s2['bw_warn']}٪ | Critical: {s2['bw_critical']}٪\n"
+        f"Suspend alerts: {'روشن ✅' if s2['suspend_alerts'] else 'خاموش ⛔'}\n\n"
+        "اگر فعال باشد، ربات به صورت دوره‌ای وضعیت VPS ها را چک می‌کند."
+    )
+    await cb.message.edit_text(text, reply_markup=alerts_kb(s2["alerts_enabled"], s2["suspend_alerts"]))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "alerts_set_thresholds")
+async def cb_alerts_set_thresholds(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(SetThresholds.disk_warn)
+    await cb.message.answer("✏️ تنظیم آستانه‌ها\n\nDisk Warn را به درصد بفرستید (مثلاً 80):")
+    await cb.answer()
+
+
+def parse_percent(text: str) -> Optional[int]:
+    t = (text or "").strip().replace("%", "").replace("٪", "")
+    if not t.isdigit():
+        return None
+    n = int(t)
+    if n < 1 or n > 100:
+        return None
+    return n
+
+
+@dp.message(SetThresholds.disk_warn)
+async def st_disk_warn(m: Message, state: FSMContext):
+    n = parse_percent(m.text or "")
+    if n is None:
+        await m.answer("عدد 1 تا 100 بفرست (مثلاً 80).")
+        return
+    await state.update_data(disk_warn=n)
+    await state.set_state(SetThresholds.disk_critical)
+    await m.answer("Disk Critical را به درصد بفرستید (مثلاً 100):")
+
+
+@dp.message(SetThresholds.disk_critical)
+async def st_disk_crit(m: Message, state: FSMContext):
+    n = parse_percent(m.text or "")
+    if n is None:
+        await m.answer("عدد 1 تا 100 بفرست (مثلاً 100).")
+        return
+    data = await state.get_data()
+    if n < data["disk_warn"]:
+        await m.answer("Critical باید >= Warn باشد. دوباره بفرست.")
+        return
+    await state.update_data(disk_critical=n)
+    await state.set_state(SetThresholds.bw_warn)
+    await m.answer("BW Warn را به درصد بفرستید (مثلاً 80):")
+
+
+@dp.message(SetThresholds.bw_warn)
+async def st_bw_warn(m: Message, state: FSMContext):
+    n = parse_percent(m.text or "")
+    if n is None:
+        await m.answer("عدد 1 تا 100 بفرست (مثلاً 80).")
+        return
+    await state.update_data(bw_warn=n)
+    await state.set_state(SetThresholds.bw_critical)
+    await m.answer("BW Critical را به درصد بفرستید (مثلاً 100):")
+
+
+@dp.message(SetThresholds.bw_critical)
+async def st_bw_crit(m: Message, state: FSMContext):
+    n = parse_percent(m.text or "")
+    if n is None:
+        await m.answer("عدد 1 تا 100 بفرست (مثلاً 100).")
+        return
+    data = await state.get_data()
+    if n < data["bw_warn"]:
+        await m.answer("Critical باید >= Warn باشد. دوباره بفرست.")
+        return
+
+    await update_alert_settings(
+        m.from_user.id,
+        disk_warn=data["disk_warn"],
+        disk_critical=data["disk_critical"],
+        bw_warn=data["bw_warn"],
+        bw_critical=n,
+    )
+    await state.clear()
+    await m.answer("✅ آستانه‌ها ذخیره شد.", reply_markup=main_menu_kb())
+
+
+# -----------------------------
+# Background alert checker
+# -----------------------------
+def extract_disk_usage(info: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    اینجا بسته به پنل ممکنه فیلدها فرق کنند.
+    اگر دقیق گفتی Virtualizor شما چه خروجی می‌دهد، این قسمت را دقیقاً مچ می‌کنم.
+    """
+    used = info.get("disk_used") or info.get("used_disk") or info.get("hdd_used")
+    total = info.get("disk") or info.get("vps_disk") or info.get("hdd")
+    try:
+        return float(used), float(total)
+    except Exception:
+        return None, None
+
+
+def extract_bw_usage(info: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    used = info.get("bandwidth_used") or info.get("bw_used") or info.get("used_bandwidth")
+    total = info.get("bandwidth") or info.get("bw") or info.get("total_bandwidth")
+    try:
+        return float(used), float(total)
+    except Exception:
+        return None, None
+
+
+async def alert_loop():
+    while True:
+        try:
+            # همه کاربرانِ دارای پروفایل را پیدا کن
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute("SELECT DISTINCT user_id FROM api_profiles")
+                users = [r[0] for r in await cur.fetchall()]
+
+            for user_id in users:
+                s = await get_alert_settings(user_id)
+                if not s["alerts_enabled"]:
+                    continue
+
+                profiles = await list_profiles(user_id)
+                for pr in profiles:
+                    p = await get_profile(user_id, pr["id"])
+                    if not p:
+                        continue
+
+                    # لیست VPS
+                    try:
+                        vps_list_data = await v_api_request(
+                            p["panel_url"], p["api_key"], p["api_pass"], p["verify_ssl"],
+                            act="vs"
+                        )
+                        vps_list = pick_vps_list(vps_list_data)
+                    except Exception:
+                        continue
+
+                    for v in vps_list:
+                        vps_id = str(v.get("vpsid") or "")
+                        if not vps_id:
+                            continue
+
+                        # جزئیات VPS
+                        try:
+                            details = await v_api_request(
+                                p["panel_url"], p["api_key"], p["api_pass"], p["verify_ssl"],
+                                act="managevs",
+                                params={"vpsid": vps_id}
+                            )
+                            info = pick_vps_details(details)
+                        except Exception:
+                            continue
+
+                        name = info.get("hostname") or info.get("name") or f"VPS {vps_id}"
+                        ip = info.get("ip") or info.get("ipaddress") or info.get("primary_ip") or "-"
+
+                        # Suspend (اگر فیلدش در پنل شما فرق دارد، مچ کن)
+                        suspended = to_int(info.get("suspended") or info.get("is_suspended") or 0, 0)
+
+                        # Disk/BW
+                        disk_used, disk_total = extract_disk_usage(info)
+                        bw_used, bw_total = extract_bw_usage(info)
+
+                        disk_pct = compute_percent(disk_used or 0, disk_total or 0) if (disk_used and disk_total) else None
+                        bw_pct = compute_percent(bw_used or 0, bw_total or 0) if (bw_used and bw_total) else None
+
+                        disk_level = classify_level(disk_pct, s["disk_warn"], s["disk_critical"])
+                        bw_level = classify_level(bw_pct, s["bw_warn"], s["bw_critical"])
+
+                        prev = await get_alert_state(user_id, p["id"], vps_id)
+
+                        # اعلان Disk
+                        if disk_level in ("warn", "critical") and disk_level != prev["last_disk_level"]:
+                            await bot.send_message(
+                                user_id,
+                                f"⚠️ Disk {disk_level.upper()}\n"
+                                f"VPS: {name}\nIP: {ip}\n"
+                                f"مصرف: {disk_pct}%"
+                            )
+
+                        # اعلان BW
+                        if bw_level in ("warn", "critical") and bw_level != prev["last_bw_level"]:
+                            await bot.send_message(
+                                user_id,
+                                f"⚠️ BW {bw_level.upper()}\n"
+                                f"VPS: {name}\nIP: {ip}\n"
+                                f"مصرف: {bw_pct}%"
+                            )
+
+                        # اعلان Suspend
+                        if s["suspend_alerts"]:
+                            if prev["last_suspend"] is None:
+                                pass
+                            else:
+                                if suspended == 1 and prev["last_suspend"] == 0:
+                                    await bot.send_message(user_id, f"⛔ VPS Suspend شد:\n{name}\nIP: {ip}")
+                                if suspended == 0 and prev["last_suspend"] == 1:
+                                    await bot.send_message(user_id, f"✅ VPS Unsuspend شد:\n{name}\nIP: {ip}")
+
+                        await set_alert_state(
+                            user_id, p["id"], vps_id,
+                            last_disk_level=disk_level,
+                            last_bw_level=bw_level,
+                            last_suspend=suspended
+                        )
+
+        except Exception:
+            # نذار حلقه بمیرد
+            pass
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
+# -----------------------------
+# Run
+# -----------------------------
+async def main():
+    await init_db()
+    # background alerts
+    asyncio.create_task(alert_loop())
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
